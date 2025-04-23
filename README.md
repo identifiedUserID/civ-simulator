@@ -22,11 +22,6 @@ A simple 2D civilization resource gathering and defense game prototype built wit
     *   Building placement buttons.
 *   **Simple Combat:** Enemies attack buildings and (eventually) units. Buildings have HP.
 
-## Screenshot / GIF (Placeholder)
-
-*(It's highly recommended to add a screenshot or GIF of the game in action here!)*
-![Gameplay Screenshot](placeholder.png)
-
 ## Getting Started
 
 ### Prerequisites
@@ -52,8 +47,8 @@ There are two ways to set up the game:
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git # Replace with your actual repo URL
-    cd your-repo-name
+    https://github.com/identifiedUserID/civ-simulator.git # Replace with your actual repo URL
+    cd civ-simulator
     ```
     Alternatively, download the repository ZIP file and extract it.
 
