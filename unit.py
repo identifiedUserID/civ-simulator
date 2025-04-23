@@ -1,295 +1,272 @@
 # unit.py
-import pygame
-import random
+import pygame # Needed for drawing
 import math
-from constants import *
+from constants import * # Import constants
+from tile import Tile
+from building import Building, TownHall # Need TownHall specifically
+
+# Type hinting for complex types passed from Game
+BuildingList = list[Building]
+ResourceDict = dict[str, int | float]
 
 class Unit:
-    def __init__(self, x, y, unit_type, game_speed_modifier=1.0):
-        # Store position as float for smoother movement between tiles
-        self.x = float(x * TILE_SIZE + TILE_SIZE / 2)
-        self.y = float(y * TILE_SIZE + TILE_SIZE / 2)
-        self.grid_x = x
-        self.grid_y = y
+    """Base class for mobile entities like Workers and Enemies."""
+    def __init__(self, x: int, y: int, unit_type: int, game_speed_modifier: float = 1.0):
+        self.x: float = float(x * TILE_SIZE + TILE_SIZE / 2)
+        self.y: float = float(y * TILE_SIZE + TILE_SIZE / 2)
+        self.grid_x: int = x
+        self.grid_y: int = y
         self.type = unit_type
-        self.target = None # Target coordinates (grid_x, grid_y) or object
-        self.state = 'idle' # idle, moving, gathering, returning, attacking
-        self.speed = 0.0
-        self.game_speed_modifier = game_speed_modifier # Store reference
+        self.target = None
+        self.target_tile: Tile | None = None
+        self.state: str = 'idle'
+        self.speed: float = 0.0
+        self.game_speed_modifier: float = game_speed_modifier
+        self.hp: int = 100
+        self.max_hp: int = 100
 
     def update_grid_pos(self):
-        self.grid_x = int(self.x // TILE_SIZE)
-        self.grid_y = int(self.y // TILE_SIZE)
+        self.grid_x = int(self.x // TILE_SIZE); self.grid_y = int(self.y // TILE_SIZE)
 
-    def move_towards(self, target_x, target_y, dt):
-        dx = target_x - self.x
-        dy = target_y - self.y
-        dist = math.sqrt(dx**2 + dy**2)
+    def set_speed_modifier(self, modifier: float):
+        self.game_speed_modifier = max(0.01, modifier)
 
-        if dist < TILE_SIZE / 4: # Close enough to target center
-             return True # Arrived
+    def move_towards(self, target_x_px: float, target_y_px: float, dt_simulated: float) -> bool:
+        dx = target_x_px - self.x; dy = target_y_px - self.y
+        dist_sq = dx*dx + dy*dy
+        stop_distance = TILE_SIZE / 4
+        if isinstance(self.target, (Tile, Building, Unit)): stop_distance = TILE_SIZE * 0.6
+        if dist_sq < stop_distance * stop_distance: return True
+        dist = math.sqrt(dist_sq)
+        if dist > 0: dx /= dist; dy /= dist
+        else: return True
+        effective_speed_pixels = self.speed * TILE_SIZE * self.game_speed_modifier * dt_simulated
+        self.x += dx * effective_speed_pixels; self.y += dy * effective_speed_pixels
+        self.update_grid_pos(); return False
 
-        # Normalize
-        dx /= dist
-        dy /= dist
-
-        effective_speed = self.speed * TILE_SIZE * self.game_speed_modifier * dt
-        self.x += dx * effective_speed
-        self.y += dy * effective_speed
-        self.update_grid_pos()
-        return False # Still moving
-
-    def draw(self, surface, camera_x, camera_y):
-        screen_x = int(self.x - camera_x)
-        screen_y = int(self.y - camera_y)
+    def draw(self, surface: pygame.Surface, camera_x: int, camera_y: int):
+        screen_x = int(self.x - camera_x); screen_y = int(self.y - camera_y)
         radius = TILE_SIZE // 3
-
-        # Culling
-        if screen_x + radius < 0 or screen_x - radius > GAME_AREA_WIDTH or \
-           screen_y + radius < 0 or screen_y - radius > SCREEN_HEIGHT:
-           return
-
-        color = WHITE # Default
-        if self.type == UNIT_WORKER:
-            color = (0, 200, 0) # Green
-        elif self.type == UNIT_ENEMY_BASIC:
-             color = RED
-
+        if not pygame.Rect(screen_x - radius, screen_y - radius, radius*2, radius*2).colliderect(surface.get_rect()): return
+        color = WHITE
+        if self.type == UNIT_WORKER: color = GREEN
+        elif self.type == UNIT_ENEMY_BASIC: color = RED
         pygame.draw.circle(surface, color, (screen_x, screen_y), radius)
+        pygame.draw.circle(surface, BLACK, (screen_x, screen_y), radius, 1)
+        if self.hp < self.max_hp and self.max_hp > 0:
+            hp_ratio = max(0.0, float(self.hp) / self.max_hp)
+            bar_width = TILE_SIZE * 0.6; bar_height = 4
+            bar_x = int(screen_x - bar_width / 2); bar_y = int(screen_y - radius - bar_height - 2)
+            pygame.draw.rect(surface, DARK_RED, (bar_x, bar_y, int(bar_width), bar_height))
+            pygame.draw.rect(surface, GREEN_GRASS, (bar_x, bar_y, int(bar_width * hp_ratio), bar_height))
 
-
+# --- Worker Unit ---
 class Worker(Unit):
-    def __init__(self, x, y, game_speed_modifier):
+    def __init__(self, x: int, y: int, game_speed_modifier: float):
         super().__init__(x, y, UNIT_WORKER, game_speed_modifier)
-        self.speed = WORKER_SPEED
-        self.resource_carried = RESOURCE_NONE
-        self.carry_amount = 0
-        self.target_tile = None # Reference to the target Tile object
-        self.gather_timer = 0
-        self.preferred_resource_order = [RESOURCE_FOOD, RESOURCE_WOOD, RESOURCE_STONE, RESOURCE_IRON] # Example order
+        self.speed = WORKER_SPEED; self.hp = WORKER_HP; self.max_hp = WORKER_HP
+        self.resource_carried: int = RESOURCE_NONE; self.carry_amount: int = 0
+        self.gather_timer: float = 0
+        self.preferred_resource_order = [RESOURCE_FOOD, RESOURCE_WOOD, RESOURCE_STONE, RESOURCE_IRON]
+        # --- Add flag to prevent error spam ---
+        self._cant_find_th_logged: bool = False
+        self._path_retry_timer: float = 0 # Timer to wait before retrying pathfinding
 
-    def update(self, dt, game_map, buildings, resources):
-        """Worker AI Logic"""
-        dt_ms = dt * 1000
+    def update(self, dt_simulated: float, game_map, buildings: BuildingList,
+               resources: ResourceDict, current_population: int):
+        dt_ms = dt_simulated * 1000
+        retry_delay = 3000 # Wait 3 seconds (in ms) before retrying path if failed
 
-        if self.state == 'idle':
-            # If carrying resources, find town hall
-            if self.carry_amount > 0:
-                self.find_town_hall_and_return(game_map, buildings)
+        # Update path retry timer if active
+        if self._path_retry_timer > 0:
+            self._path_retry_timer -= dt_ms
+            if self._path_retry_timer <= 0:
+                self._path_retry_timer = 0 # Reset timer
+                # Allow trying to find TH again below
             else:
-                # Find nearby resource
-                found_resource = False
-                for res_type in self.preferred_resource_order:
-                     # Prioritize needed resources? Maybe later.
-                     target_tile = game_map.find_nearest_resource(self.grid_x, self.grid_y, res_type)
-                     if target_tile:
-                         self.target_tile = target_tile
-                         self.target = (target_tile.x, target_tile.y)
-                         self.state = 'moving_to_resource'
-                         #print(f"Worker at ({self.grid_x},{self.grid_y}) moving to {RESOURCE_NAMES[res_type]} at ({target_tile.x},{target_tile.y})")
-                         found_resource = True
-                         break
-                if not found_resource:
-                    # Wander randomly? Or just stay idle.
-                    pass
+                # Still waiting to retry, potentially wander slightly or just wait
+                # For simplicity, just wait for now
+                return # Skip rest of update while waiting
+
+        # --- State Machine ---
+        if self.state == 'idle':
+            if self.carry_amount > 0: self.find_town_hall_and_return(game_map, buildings)
+            else: self.find_resource_and_move(game_map, resources, current_population)
 
         elif self.state == 'moving_to_resource':
-            if self.target_tile and self.target_tile.resource_amount > 0:
-                target_center_x = self.target[0] * TILE_SIZE + TILE_SIZE / 2
-                target_center_y = self.target[1] * TILE_SIZE + TILE_SIZE / 2
-                if self.move_towards(target_center_x, target_center_y, dt):
-                    self.state = 'gathering'
-                    self.gather_timer = WORKER_GATHER_TIME
-            else:
-                # Target disappeared or became invalid
-                self.state = 'idle'
-                self.target = None
-                self.target_tile = None
+            # ... (moving logic remains the same as previous version) ...
+            if self.target_tile and self.target_tile.resource_type != RESOURCE_NONE and self.target_tile.resource_amount > 0:
+                target_cx = self.target_tile.x * TILE_SIZE + TILE_SIZE / 2
+                target_cy = self.target_tile.y * TILE_SIZE + TILE_SIZE / 2
+                if self.move_towards(target_cx, target_cy, dt_simulated):
+                    if self.target_tile.resource_type != RESOURCE_NONE and self.target_tile.resource_amount > 0:
+                        self.state = 'gathering'; self.gather_timer = 0
+                    else: self.state = 'idle'; self.clear_target()
+            else: self.state = 'idle'; self.clear_target()
 
         elif self.state == 'gathering':
-            self.gather_timer -= dt_ms * self.game_speed_modifier
+            # ... (gathering logic remains the same as previous version) ...
+            self.gather_timer -= dt_ms
             if self.gather_timer <= 0:
                 if self.target_tile and self.target_tile.resource_amount > 0:
-                    gathered, res_type_gathered = self.target_tile.gather_resource(WORKER_GATHER_RATE)
+                    gathered, res_type = self.target_tile.gather_resource(WORKER_GATHER_RATE)
                     if gathered > 0:
-                        # If starting to carry or switching type, set it
-                        if self.carry_amount == 0:
-                            self.resource_carried = res_type_gathered
-                        # Add to carried amount if it's the same type
-                        if self.resource_carried == res_type_gathered:
-                             self.carry_amount += gathered
-                             #print(f"Gathered {gathered} {RESOURCE_NAMES[self.resource_carried]}, carrying {self.carry_amount}")
-                        else:
-                             # Cannot mix resources, drop off first (should ideally happen)
-                             self.find_town_hall_and_return(game_map, buildings)
+                        if self.carry_amount == 0: self.resource_carried = res_type
+                        if self.resource_carried == res_type: self.carry_amount += gathered
+                        else: self.find_town_hall_and_return(game_map, buildings)
 
-                    # If resource depleted or worker full, return
-                    if self.target_tile.resource_amount <= 0 or self.carry_amount >= WORKER_CAPACITY:
-                        if self.target_tile.resource_amount <= 0:
-                             # Mark tile for respawn tracking in the map
-                             coords = (self.target_tile.x, self.target_tile.y)
-                             if coords not in game_map.depleted_resources:
-                                 game_map.depleted_resources[coords] = res_type_gathered # Store original type
-                                 self.target_tile.respawn_timer = 1 # Needs > 0 to start ticking down
-
-                        self.find_town_hall_and_return(game_map, buildings)
-                    else:
-                         # Continue gathering
-                         self.gather_timer = WORKER_GATHER_TIME
+                    if self.state != 'moving_to_townhall':
+                        if self.target_tile.resource_amount <= 0 or self.carry_amount >= WORKER_CAPACITY:
+                            if self.target_tile.resource_amount <= 0:
+                                game_map.mark_for_respawn(self.target_tile.x, self.target_tile.y)
+                            self.find_town_hall_and_return(game_map, buildings)
+                        else: self.gather_timer = WORKER_GATHER_TIME
                 else:
-                    # Resource gone while gathering? Return or find new one
-                     self.find_town_hall_and_return(game_map, buildings) # Prioritize return if carrying anything
+                    if self.carry_amount > 0: self.find_town_hall_and_return(game_map, buildings)
+                    else: self.state = 'idle'; self.clear_target()
 
         elif self.state == 'moving_to_townhall':
-            if self.target:
-                target_center_x = self.target[0] * TILE_SIZE + TILE_SIZE / 2
-                target_center_y = self.target[1] * TILE_SIZE + TILE_SIZE / 2
-                if self.move_towards(target_center_x, target_center_y, dt):
+            # Target should be TownHall object
+            if isinstance(self.target, TownHall):
+                target_cx = self.target.x * TILE_SIZE + TILE_SIZE / 2
+                target_cy = self.target.y * TILE_SIZE + TILE_SIZE / 2
+                if self.move_towards(target_cx, target_cy, dt_simulated):
                      self.state = 'dropping_off'
-            else: # Target lost? Find again or idle
-                self.find_town_hall_and_return(game_map, buildings)
-                if self.state != 'moving_to_townhall': # If couldn't find one
-                    self.state = 'idle'
-
+                     self._cant_find_th_logged = False # Reset log flag on successful arrival
+                     self._path_retry_timer = 0 # Reset retry timer
+            else: # Target lost or invalid (e.g., TH destroyed)
+                 # Try to find TH again, handle failure case within the find method
+                 if not self.find_town_hall_and_return(game_map, buildings):
+                      # If still can't find it, remain idle (find method logs error once)
+                      self.state = 'idle'; self.clear_target()
 
         elif self.state == 'dropping_off':
-            if self.resource_carried != RESOURCE_NONE and self.carry_amount > 0:
-                resource_name = RESOURCE_NAMES.get(self.resource_carried)
-                if resource_name and resource_name != "None":
-                     resources[resource_name] += self.carry_amount
-                     #print(f"Dropped off {self.carry_amount} {resource_name}. Total: {resources}")
-                self.carry_amount = 0
-                self.resource_carried = RESOURCE_NONE
-            self.state = 'idle' # Look for new task
+            # ... (dropping off logic remains the same as previous version) ...
+            if self.carry_amount > 0:
+                res_name = RESOURCE_NAMES.get(self.resource_carried)
+                if res_name and res_name != "None":
+                     if res_name not in resources: resources[res_name] = 0
+                     resources[res_name] += self.carry_amount
+                self.carry_amount = 0; self.resource_carried = RESOURCE_NONE
+            self._cant_find_th_logged = False # Reset log flag on successful drop-off
+            self._path_retry_timer = 0 # Reset retry timer
+            self.state = 'idle'; self.clear_target()
 
-    def find_town_hall_and_return(self, game_map, buildings):
-        # Find nearest Town Hall to drop off resources
+    def find_resource_and_move(self, game_map, resources: ResourceDict, current_population: int):
+        # ... (logic remains the same as previous version) ...
+        self.clear_target(); found_tile = None
+        for res_type in self.preferred_resource_order:
+             needed = True
+             if res_type == RESOURCE_FOOD and resources.get('Food', 0) > current_population * 15: needed = False
+             if needed:
+                found_tile = game_map.find_nearest_resource(self.grid_x, self.grid_y, res_type)
+                if found_tile: break
+        if not found_tile:
+             for res_type in [RESOURCE_WOOD, RESOURCE_FOOD, RESOURCE_STONE, RESOURCE_IRON]:
+                 found_tile = game_map.find_nearest_resource(self.grid_x, self.grid_y, res_type)
+                 if found_tile: break
+        if found_tile:
+            self.target_tile = found_tile; self.target = (found_tile.x, found_tile.y)
+            self.state = 'moving_to_resource'
+        else: self.state = 'idle'
+
+    def find_town_hall_and_return(self, game_map, buildings: BuildingList) -> bool:
+        """
+        Finds nearest Town Hall, sets target/state. Handles failure without spamming.
+        Returns True if TH found AND pathing is initiated, False otherwise.
+        """
+        # Only search if retry timer is not active
+        if self._path_retry_timer > 0:
+            return False # Still waiting to retry
+
         town_hall = game_map.find_nearest_building(self.grid_x, self.grid_y, BUILDING_TOWNHALL)
         if town_hall:
-            self.target = (town_hall.x, town_hall.y)
+            self.target = town_hall
+            self.target_tile = None
             self.state = 'moving_to_townhall'
-            #print(f"Worker at ({self.grid_x},{self.grid_y}) returning to TH at ({town_hall.x},{town_hall.y})")
+            # If we successfully found it *now*, reset the logged flag
+            self._cant_find_th_logged = False
+            return True
         else:
-             # No town hall? Panic! Or just idle.
-             self.state = 'idle'
-             self.target = None
-             self.target_tile = None
+            # --- Error Handling ---
+            if not self._cant_find_th_logged: # Log only once
+                print(f"CRITICAL: Worker at ({self.grid_x},{self.grid_y}) cannot find path to Town Hall!")
+                self._cant_find_th_logged = True
+            # Don't change state back to idle immediately if carrying resources.
+            # Stay in current state (or moving_to_townhall if called from idle/gather)
+            # Set a timer to retry pathfinding after a delay
+            self._path_retry_timer = 3000 # e.g., wait 3 seconds
+            print(f"Worker at ({self.grid_x},{self.grid_y}) will retry finding TH in {self._path_retry_timer/1000:.1f}s.") # Feedback
+            # Ensure state is set to moving_to_townhall so it keeps trying (or stays put)
+            self.state = 'moving_to_townhall'
+            self.target = None # Clear specific target object, but keep state
+            return False # Pathfinding failed for now
 
+    def clear_target(self):
+        """Resets target info."""
+        self.target = None; self.target_tile = None
 
+# --- Enemy Unit ---
+# ... (Enemy class remains the same as previous correct version) ...
 class Enemy(Unit):
-    def __init__(self, x, y, game_speed_modifier):
+    def __init__(self, x: int, y: int, game_speed_modifier: float):
         super().__init__(x, y, UNIT_ENEMY_BASIC, game_speed_modifier)
-        self.speed = ENEMY_SPEED
-        self.hp = ENEMY_HP
-        self.damage = ENEMY_DAMAGE
-        self.attack_rate = ENEMY_ATTACK_RATE
-        self.attack_timer = 0
-        self.target_unit_or_building = None
+        self.speed = ENEMY_SPEED; self.hp = ENEMY_HP; self.max_hp = ENEMY_HP
+        self.damage = ENEMY_DAMAGE; self.attack_rate = ENEMY_ATTACK_RATE
+        self.attack_timer: float = 0
+        self.target_object: Unit | Building | None = None
 
-    def update(self, dt, game_map, buildings, workers):
-        dt_ms = dt * 1000 * self.game_speed_modifier
-        self.attack_timer -= dt_ms
+    def update(self, dt_simulated: float, buildings: BuildingList, workers: list['Worker']):
+        dt_ms = dt_simulated * 1000
+        if self.attack_timer > 0: self.attack_timer -= dt_ms
 
         if self.state == 'idle':
-            # Scan for targets (workers or buildings)
-            self.target_unit_or_building = self.find_target(workers, buildings)
-            if self.target_unit_or_building:
+            found_target = self.find_target(workers, buildings)
+            if found_target:
+                self.target_object = found_target; self.target = self.target_object
                 self.state = 'moving_to_target'
-            else:
-                 # Wander randomly? (simple version: stay idle)
-                 pass
-
         elif self.state == 'moving_to_target':
-             if self.target_unit_or_building and self.target_unit_or_building.hp > 0: # Target still valid?
-                 # Simplistic target coords - needs better handling for moving targets
-                 target_x_px = 0
-                 target_y_px = 0
-                 if isinstance(self.target_unit_or_building, Unit):
-                     target_x_px = self.target_unit_or_building.x
-                     target_y_px = self.target_unit_or_building.y
-                 elif isinstance(self.target_unit_or_building, Building):
-                     target_x_px = self.target_unit_or_building.x * TILE_SIZE + TILE_SIZE / 2
-                     target_y_px = self.target_unit_or_building.y * TILE_SIZE + TILE_SIZE / 2
-
-                 # Check distance for attack range instead of moving exactly on top
-                 dx = target_x_px - self.x
-                 dy = target_y_px - self.y
-                 dist_sq = dx**2 + dy**2
-
-                 attack_range = TILE_SIZE * 1.1 # Attack if slightly more than 1 tile away
-
-                 if dist_sq < attack_range**2:
-                     self.state = 'attacking'
-                 else:
-                     # Move towards target
-                     if not self.move_towards(target_x_px, target_y_px, dt):
-                         pass # Still moving
-                     else: # Arrived at approx location, switch to attack
-                        self.state = 'attacking'
-
-             else: # Target lost or destroyed
-                 self.state = 'idle'
-                 self.target_unit_or_building = None
-
+             if self.target_object and self.target_object.hp > 0:
+                 target_px, target_py = self.get_target_pixel_coords()
+                 dx, dy = target_px - self.x, target_py - self.y
+                 if dx*dx + dy*dy < (TILE_SIZE * 1.1)**2:
+                     self.state = 'attacking'; self.attack_timer = 0
+                 else: self.move_towards(target_px, target_py, dt_simulated)
+             else: self.state = 'idle'; self.clear_target()
         elif self.state == 'attacking':
-            if self.target_unit_or_building and self.target_unit_or_building.hp > 0:
-                # Check range again, maybe target moved
-                target_x_px = 0
-                target_y_px = 0
-                if isinstance(self.target_unit_or_building, Unit):
-                     target_x_px = self.target_unit_or_building.x
-                     target_y_px = self.target_unit_or_building.y
-                elif isinstance(self.target_unit_or_building, Building):
-                    target_x_px = self.target_unit_or_building.x * TILE_SIZE + TILE_SIZE / 2
-                    target_y_px = self.target_unit_or_building.y * TILE_SIZE + TILE_SIZE / 2
-
-                dx = target_x_px - self.x
-                dy = target_y_px - self.y
-                dist_sq = dx**2 + dy**2
-                attack_range = TILE_SIZE * 1.2 # Slightly larger range check when attacking
-
-                if dist_sq > attack_range**2:
-                    # Target moved out of range
+            if self.target_object and self.target_object.hp > 0:
+                target_px, target_py = self.get_target_pixel_coords()
+                dx, dy = target_px - self.x, target_py - self.y
+                if dx*dx + dy*dy > (TILE_SIZE * 1.4)**2:
                     self.state = 'moving_to_target'
                 elif self.attack_timer <= 0:
-                    # Attack!
-                    print(f"Enemy at ({self.grid_x},{self.grid_y}) attacking target!")
-                    self.target_unit_or_building.hp -= self.damage
-                    print(f"Target HP: {self.target_unit_or_building.hp}")
-                    if self.target_unit_or_building.hp <= 0:
-                        print("Target destroyed!")
-                        # Target cleanup happens in main game loop
-                        self.state = 'idle'
-                        self.target_unit_or_building = None
-                    self.attack_timer = self.attack_rate # Reset timer
-            else: # Target lost or destroyed
-                self.state = 'idle'
-                self.target_unit_or_building = None
+                    self.target_object.hp -= self.damage
+                    if self.target_object.hp <= 0:
+                        print(f"Enemy destroyed {type(self.target_object).__name__}!")
+                        self.state = 'idle'; self.clear_target()
+                    else: self.attack_timer = self.attack_rate
+            else: self.state = 'idle'; self.clear_target()
 
+    def find_target(self, workers: list['Worker'], buildings: BuildingList) -> Unit | Building | None:
+        nearest_target = None; min_dist_sq = ENEMY_SCAN_RADIUS_SQ
+        for worker in workers:
+            if worker.hp > 0:
+                dist_sq = (worker.x - self.x)**2 + (worker.y - self.y)**2
+                if dist_sq < min_dist_sq: min_dist_sq = dist_sq; nearest_target = worker
+        for building in buildings:
+             if building.hp > 0:
+                 b_cx = building.x * TILE_SIZE + TILE_SIZE / 2
+                 b_cy = building.y * TILE_SIZE + TILE_SIZE / 2
+                 dist_sq = (b_cx - self.x)**2 + (b_cy - self.y)**2
+                 if dist_sq < min_dist_sq: min_dist_sq = dist_sq; nearest_target = building
+        return nearest_target
 
-    def find_target(self, workers, buildings, scan_radius_sq=15**2 * TILE_SIZE**2):
-         """Find nearest worker or building"""
-         nearest_target = None
-         min_dist_sq = scan_radius_sq
+    def get_target_pixel_coords(self) -> tuple[float, float]:
+         if isinstance(self.target_object, Unit): return self.target_object.x, self.target_object.y
+         if isinstance(self.target_object, Building):
+             return (self.target_object.x * TILE_SIZE + TILE_SIZE / 2,
+                     self.target_object.y * TILE_SIZE + TILE_SIZE / 2)
+         return self.x, self.y
 
-         # Check workers
-         for worker in workers:
-             dx = worker.x - self.x
-             dy = worker.y - self.y
-             dist_sq = dx**2 + dy**2
-             if dist_sq < min_dist_sq:
-                 min_dist_sq = dist_sq
-                 nearest_target = worker
-
-         # Check buildings (TownHall first maybe?)
-         for building in buildings:
-              b_center_x = building.x * TILE_SIZE + TILE_SIZE / 2
-              b_center_y = building.y * TILE_SIZE + TILE_SIZE / 2
-              dx = b_center_x - self.x
-              dy = b_center_y - self.y
-              dist_sq = dx**2 + dy**2
-              if dist_sq < min_dist_sq:
-                  min_dist_sq = dist_sq
-                  nearest_target = building
-
-         return nearest_target
+    def clear_target(self):
+        self.target = None; self.target_object = None

@@ -3,26 +3,29 @@ import pygame
 import random
 import noise # Perlin noise
 import math
-from constants import *
-from tile import Tile
+import collections # For deque in BFS
+from constants import * # Import constants
+from tile import Tile   # Import Tile class
+# Need Building base class for type hinting / isinstance check in find_nearest
+from building import Building
 
 class GameMap:
-    def __init__(self, radius):
+    def __init__(self, radius: int):
         self.radius = radius
         self.diameter = radius * 2 + 1
-        self.tiles = [[None for _ in range(self.diameter)] for _ in range(self.diameter)]
-        self.depleted_resources = {} # Store coords and original type for respawn: (x, y): type
+        self.tiles: list[list[Tile | None]] = [[None for _ in range(self.diameter)] for _ in range(self.diameter)]
+        self.pending_respawn_tiles: set[tuple[int, int]] = set()
         self._generate_map()
         self.width_pixels = self.diameter * TILE_SIZE
         self.height_pixels = self.diameter * TILE_SIZE
 
+    # --- _generate_map, _generate_noise_map, _place_initial_resources remain the same ---
     def _generate_map(self):
+        """Generates the entire map procedurally using noise."""
         seed = random.randint(0, 10000)
         center_x, center_y = self.radius, self.radius
+        print(f"Generating map with radius {self.radius} (Diameter: {self.diameter}), Seed: {seed}")
 
-        print(f"Generating map with radius {self.radius} (Diameter: {self.diameter})")
-
-        # Generate noise maps
         elevation_map = self._generate_noise_map(seed + 0)
         temperature_map = self._generate_noise_map(seed + 1)
         moisture_map = self._generate_noise_map(seed + 2)
@@ -30,200 +33,210 @@ class GameMap:
         for y in range(self.diameter):
             for x in range(self.diameter):
                 dist_from_center = math.sqrt((x - center_x)**2 + (y - center_y)**2)
-                dist_ratio = dist_from_center / self.radius
+                dist_ratio = dist_from_center / max(1, self.radius)
 
-                # Adjust elevation towards edges to create water border
                 elevation = elevation_map[y][x]
-                edge_factor = max(0, (dist_ratio - (1.0 - WATER_EDGE_PERCENT)) / WATER_EDGE_PERCENT) # 0 to 1 in the outer edge %
-                elevation -= edge_factor * 0.8 # Significantly lower elevation at the very edge
+                edge_start_ratio = 1.0 - WATER_EDGE_PERCENT
+                if dist_ratio > edge_start_ratio and WATER_EDGE_PERCENT > 0:
+                    edge_factor = (dist_ratio - edge_start_ratio) / WATER_EDGE_PERCENT
+                    elevation -= edge_factor * 0.8 # Make edges water
 
                 temp = temperature_map[y][x]
                 moisture = moisture_map[y][x]
 
                 # Determine Terrain Type
                 if elevation < ELEVATION_THRESHOLD:
-                     terrain_type = TERRAIN_WATER
-                     if temp < TEMP_THRESHOLD_LOW - 0.1: # Colder water = ice
-                         terrain_type = TERRAIN_ICE
-                else:
-                    terrain_type = TERRAIN_GROUND
+                    terrain_type = TERRAIN_WATER
+                    if temp < TEMP_THRESHOLD_LOW - 0.1: terrain_type = TERRAIN_ICE
+                else: terrain_type = TERRAIN_GROUND
 
-                # Determine Biome (only for ground/ice)
-                biome = BIOME_NONE
-                if terrain_type == TERRAIN_WATER:
-                    biome = BIOME_WATER
-                elif terrain_type == TERRAIN_ICE:
-                     biome = BIOME_ARCTIC # Ice is part of arctic
-                else: # Ground
-                    if temp < TEMP_THRESHOLD_LOW:
-                        biome = BIOME_ARCTIC
-                    elif temp > TEMP_THRESHOLD_HIGH and moisture < MOISTURE_THRESHOLD_LOW:
-                        biome = BIOME_DESERT
-                    elif moisture > MOISTURE_THRESHOLD_HIGH:
-                         biome = BIOME_FOREST
-                    else: # Default to Forest-like if no other match
-                        biome = BIOME_FOREST # Or create a 'Plains' biome
+                # Determine Biome
+                biome = BIOME_WATER
+                if terrain_type == TERRAIN_GROUND:
+                    if temp < TEMP_THRESHOLD_LOW: biome = BIOME_ARCTIC
+                    elif temp > TEMP_THRESHOLD_HIGH and moisture < MOISTURE_THRESHOLD_LOW: biome = BIOME_DESERT
+                    elif moisture > MOISTURE_THRESHOLD_HIGH: biome = BIOME_FOREST
+                    else: biome = BIOME_FOREST # Default ground biome
+                elif terrain_type == TERRAIN_ICE: biome = BIOME_ARCTIC
 
-                tile = Tile(x, y, terrain_type, biome)
-                self.tiles[y][x] = tile
+                self.tiles[y][x] = Tile(x, y, terrain_type, biome)
 
-        self._place_resources()
+        self._place_initial_resources()
         print("Map generation complete.")
 
+    def _generate_noise_map(self, seed_offset: int) -> list[list[float]]:
+        """Generates a 2D noise map using Perlin noise."""
+        map_data = [[0.0 for _ in range(self.diameter)] for _ in range(self.diameter)]
+        for y in range(self.diameter):
+            for x in range(self.diameter):
+                map_data[y][x] = noise.pnoise2(
+                    x * NOISE_SCALE, y * NOISE_SCALE,
+                    octaves=NOISE_OCTAVES, persistence=NOISE_PERSISTENCE,
+                    lacunarity=NOISE_LACUNARITY, base=seed_offset
+                )
+        return map_data
 
-    def _generate_noise_map(self, seed_offset):
-         map_data = [[0.0 for _ in range(self.diameter)] for _ in range(self.diameter)]
-         for y in range(self.diameter):
-             for x in range(self.diameter):
-                 map_data[y][x] = noise.pnoise2(
-                     x * NOISE_SCALE,
-                     y * NOISE_SCALE,
-                     octaves=NOISE_OCTAVES,
-                     persistence=NOISE_PERSISTENCE,
-                     lacunarity=NOISE_LACUNARITY,
-                     base=seed_offset
-                 )
-         return map_data
-
-    def _place_resources(self):
+    def _place_initial_resources(self):
+        """Places starting resources based on biome."""
+        print("Placing initial resources...")
         for y in range(self.diameter):
             for x in range(self.diameter):
                 tile = self.tiles[y][x]
-                if tile.terrain_type == TERRAIN_GROUND:
-                    # Base probability - adjust these values for balance
-                    prob_factor = 0.1
+                if tile and tile.terrain_type == TERRAIN_GROUND:
+                    prob = random.random()
+                    res_type = RESOURCE_NONE
+                    min_r, max_r = 0, 0
+                    amount_mod = 1.0
 
                     if tile.biome == BIOME_FOREST:
-                        if random.random() < prob_factor * 3.0: # Higher chance in forest
-                             if random.random() < 0.7: # Mostly wood
-                                 tile.set_resource(RESOURCE_WOOD, random.randint(RESOURCE_START_AMOUNT[RESOURCE_WOOD]//2, RESOURCE_START_AMOUNT[RESOURCE_WOOD]))
-                             else: # Some food
-                                 tile.set_resource(RESOURCE_FOOD, random.randint(RESOURCE_START_AMOUNT[RESOURCE_FOOD]//2, RESOURCE_START_AMOUNT[RESOURCE_FOOD]))
+                        if prob < RESOURCE_SPAWN_DENSITY * 2.5:
+                             res_type = RESOURCE_WOOD if random.random() < 0.7 else RESOURCE_FOOD
                     elif tile.biome == BIOME_DESERT:
-                        if random.random() < prob_factor * 1.5: # Moderate chance in desert
-                             if random.random() < 0.6: # Mostly stone
-                                 tile.set_resource(RESOURCE_STONE, random.randint(RESOURCE_START_AMOUNT[RESOURCE_STONE]//2, RESOURCE_START_AMOUNT[RESOURCE_STONE]))
-                             else: # Some iron
-                                 tile.set_resource(RESOURCE_IRON, random.randint(RESOURCE_START_AMOUNT[RESOURCE_IRON]//2, RESOURCE_START_AMOUNT[RESOURCE_IRON]))
+                        if prob < RESOURCE_SPAWN_DENSITY * 1.8:
+                             res_type = RESOURCE_STONE if random.random() < 0.6 else RESOURCE_IRON
                     elif tile.biome == BIOME_ARCTIC:
-                         if random.random() < prob_factor * 0.2: # Low chance in arctic
-                             if random.random() < 0.5:
-                                 tile.set_resource(RESOURCE_STONE, random.randint(RESOURCE_START_AMOUNT[RESOURCE_STONE]//4, RESOURCE_START_AMOUNT[RESOURCE_STONE]//2))
-                             # else: Maybe rare iron? For now, mostly barren
+                         if prob < RESOURCE_SPAWN_DENSITY * 0.3:
+                             res_type = RESOURCE_STONE
+                             amount_mod = 0.5
 
+                    if res_type != RESOURCE_NONE and res_type in RESOURCE_BASE_AMOUNT:
+                        min_r, max_r = RESOURCE_BASE_AMOUNT[res_type]
+                        amount = random.randint(int(min_r * amount_mod), int(max_r * amount_mod))
+                        tile.set_resource(res_type, max(1, amount))
 
-    def get_tile(self, x, y):
+        print("Resource placement finished.")
+
+    def get_tile(self, x: int, y: int) -> Tile | None:
+        """Safely retrieves a tile at given grid coordinates."""
         if 0 <= x < self.diameter and 0 <= y < self.diameter:
             return self.tiles[y][x]
         return None
 
-    def get_random_walkable_tile(self):
-        attempts = 0
-        while attempts < 1000:
-            x = random.randint(0, self.diameter - 1)
-            y = random.randint(0, self.diameter - 1)
-            tile = self.get_tile(x, y)
-            if tile and tile.walkable and tile.resource_type == RESOURCE_NONE and tile.building is None:
-                # Also try to avoid starting right on the water edge if possible
-                 dist_from_center = math.sqrt((x - self.radius)**2 + (y - self.radius)**2)
-                 dist_ratio = dist_from_center / self.radius
-                 if dist_ratio < 0.8: # Avoid outer 20% for starting position
-                    return tile
-            attempts += 1
-        # Fallback if random spot not found quickly
-        for y in range(self.radius - 5, self.radius + 5):
-             for x in range(self.radius - 5, self.radius + 5):
-                 tile = self.get_tile(x,y)
-                 if tile and tile.walkable and tile.resource_type == RESOURCE_NONE and tile.building is None:
-                     return tile
-        return None # Should ideally always find a spot on a reasonable map
+    def get_random_walkable_tile(self, avoid_edge_percent=0.2) -> Tile | None:
+        """Finds a random suitable starting tile."""
+        attempts = 0; max_attempts = 1000
+        min_dist_ratio = 0.0; max_dist_ratio = 1.0 - avoid_edge_percent
+        center_x, center_y = self.radius, self.radius
 
-    def find_nearest_resource(self, start_x, start_y, resource_type, max_radius=15):
-        """Simple BFS-like search for the nearest resource"""
-        q = [(start_x, start_y, 0)]
+        while attempts < max_attempts:
+            x = random.randint(0, self.diameter - 1); y = random.randint(0, self.diameter - 1)
+            tile = self.get_tile(x, y)
+            if tile and tile.walkable and tile.building is None and tile.resource_type == RESOURCE_NONE:
+                dist_ratio = math.sqrt((x - center_x)**2 + (y - center_y)**2) / max(1, self.radius)
+                if min_dist_ratio <= dist_ratio <= max_dist_ratio: return tile
+            attempts += 1
+
+        print("Warning: Random suitable starting tile search failed, performing grid search...")
+        search_radius = int(self.radius * max_dist_ratio)
+        for r in range(search_radius + 1):
+            for dx in range(-r, r + 1):
+                 for dy in range(-r, r + 1):
+                     if abs(dx) < r and abs(dy) < r: continue
+                     x, y = center_x + dx, center_y + dy
+                     if 0 <= x < self.diameter and 0 <= y < self.diameter:
+                         tile = self.tiles[y][x]
+                         if tile.walkable and tile.building is None and tile.resource_type == RESOURCE_NONE:
+                             print(f"Fallback search found tile at ({x},{y}).")
+                             return tile
+
+        print("CRITICAL ERROR: Could not find ANY walkable starting tile!")
+        return None
+
+    def find_nearest_resource(self, start_x: int, start_y: int, resource_type: int, max_search_radius=20) -> Tile | None:
+        """Finds the nearest tile with the specified resource using BFS."""
+        if resource_type == RESOURCE_NONE: return None
+        q = collections.deque([(start_x, start_y, 0)]); visited = set([(start_x, start_y)])
+        while q:
+            x, y, dist = q.popleft()
+            if dist >= max_search_radius: continue
+            tile = self.get_tile(x, y)
+            if tile and tile.resource_type == resource_type and tile.resource_amount > 0: return tile
+            for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+                nx, ny = x + dx, y + dy
+                if (nx, ny) not in visited:
+                    neighbor_tile = self.get_tile(nx, ny)
+                    if neighbor_tile:
+                        can_path = neighbor_tile.walkable or \
+                                   (neighbor_tile.resource_type == resource_type and neighbor_tile.resource_amount > 0)
+                        if can_path: visited.add((nx, ny)); q.append((nx, ny, dist + 1))
+        return None
+
+    def find_nearest_building(self, start_x: int, start_y: int, building_type: int, max_search_radius=40) -> Building | None:
+        """
+        Finds the nearest building of the specified type using BFS.
+        Allows pathing through walkable tiles OR the target building tile itself.
+        """
+        q = collections.deque([(start_x, start_y, 0)])
         visited = set([(start_x, start_y)])
         while q:
-            x, y, dist = q.pop(0)
-
-            if dist > max_radius: continue
+            x, y, dist = q.popleft()
+            if dist >= max_search_radius: continue
 
             tile = self.get_tile(x, y)
-            if tile and tile.resource_type == resource_type and tile.resource_amount > 0:
-                return tile # Found it
+            # Check if current tile has the target building
+            if tile and tile.building and tile.building.type == building_type:
+                return tile.building # Found it
 
-            # Check neighbors
+            # Explore neighbors
             for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
                 nx, ny = x + dx, y + dy
                 if (nx, ny) not in visited:
                      neighbor_tile = self.get_tile(nx, ny)
-                     # Can path through walkable tiles or the target resource tile itself
-                     if neighbor_tile and (neighbor_tile.walkable or (neighbor_tile.resource_type == resource_type and neighbor_tile.resource_amount > 0)):
-                        visited.add((nx, ny))
-                        q.append((nx, ny, dist + 1))
-        return None # Not found within radius
-
-    def find_nearest_building(self, start_x, start_y, building_type, max_radius=30):
-         """Simple BFS-like search for the nearest building of a type"""
-         q = [(start_x, start_y, 0)]
-         visited = set([(start_x, start_y)])
-         while q:
-             x, y, dist = q.pop(0)
-
-             if dist > max_radius: continue
-
-             tile = self.get_tile(x, y)
-             if tile and tile.building and tile.building.type == building_type:
-                 return tile.building # Found it
-
-             # Check neighbors
-             for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-                 nx, ny = x + dx, y + dy
-                 if (nx, ny) not in visited:
-                      neighbor_tile = self.get_tile(nx, ny)
-                      if neighbor_tile and neighbor_tile.walkable: # Can only path through walkable
-                         visited.add((nx, ny))
-                         q.append((nx, ny, dist + 1))
-         return None
+                     if neighbor_tile:
+                         # --- MODIFIED BFS PATHING LOGIC ---
+                         # Can path through walkable tiles OR the specific target building tile
+                         is_target_building_tile = (neighbor_tile.building and
+                                                    neighbor_tile.building.type == building_type)
+                         if neighbor_tile.walkable or is_target_building_tile:
+                         # --- END MODIFICATION ---
+                            visited.add((nx, ny))
+                            q.append((nx, ny, dist + 1))
+        return None # Not found
 
 
-    def update_respawns(self, dt_ms, respawn_rate_modifier):
-        spawned_coords = []
-        # Iterate over a copy of keys because we might modify the dict
-        for coords, original_type in list(self.depleted_resources.items()):
-            tile = self.get_tile(coords[0], coords[1])
-            if tile:
-                tile.start_respawn(respawn_rate_modifier) # Ensure timer is running if not already
-                if tile.update_respawn(dt_ms):
-                     # Respawn the resource
-                     tile.set_resource(original_type, RESOURCE_START_AMOUNT[original_type])
-                     spawned_coords.append(coords) # Mark for removal from depleted list
+    def mark_for_respawn(self, x: int, y: int):
+        """Adds a depleted tile's coordinates to the set needing respawn checks."""
+        if 0 <= x < self.diameter and 0 <= y < self.diameter:
+            tile = self.get_tile(x, y)
+            if tile and tile.resource_original_type != RESOURCE_NONE and tile.resource_type == RESOURCE_NONE:
+                self.pending_respawn_tiles.add((x, y))
 
-        # Remove respawned resources from the tracking dict
-        for coords in spawned_coords:
-            del self.depleted_resources[coords]
+    def update_respawns(self, dt_ms_simulated: float, respawn_rate_modifier: float):
+        """Checks tiles marked for respawn, manages timers, and respawns resources."""
+        if not self.pending_respawn_tiles: return
 
+        processed_coords = set()
+        for x, y in list(self.pending_respawn_tiles): # Iterate copy
+            tile = self.get_tile(x, y)
+            if not tile: processed_coords.add((x,y)); continue
 
-    def draw(self, surface, camera_x, camera_y):
-        # Calculate visible tile range
+            is_eligible = (tile.terrain_type == TERRAIN_GROUND and
+                           tile.building is None and
+                           tile.resource_type == RESOURCE_NONE and
+                           tile.resource_original_type != RESOURCE_NONE)
+
+            if not is_eligible:
+                tile.resource_respawn_timer = 0; tile.resource_original_type = RESOURCE_NONE
+                processed_coords.add((x, y)); continue
+
+            if tile.resource_respawn_timer <= 0: tile.start_respawn_timer(respawn_rate_modifier)
+
+            if tile.resource_respawn_timer > 0:
+                if tile.update_respawn_timer(dt_ms_simulated):
+                     tile.respawn_resource() # Handles internal state reset
+                     processed_coords.add((x, y))
+
+        self.pending_respawn_tiles -= processed_coords
+
+    def draw(self, surface, camera_x: int, camera_y: int):
+        """Draws the visible portion of the map's tiles and resources."""
+        import pygame
         start_col = max(0, camera_x // TILE_SIZE)
-        end_col = min(self.diameter, (camera_x + GAME_AREA_WIDTH) // TILE_SIZE + 1)
+        end_col = min(self.diameter, (camera_x + GAME_AREA_WIDTH) // TILE_SIZE + 2)
         start_row = max(0, camera_y // TILE_SIZE)
-        end_row = min(self.diameter, (camera_y + SCREEN_HEIGHT) // TILE_SIZE + 1)
+        end_row = min(self.diameter, (camera_y + SCREEN_HEIGHT) // TILE_SIZE + 2)
 
-        # Draw base tiles first
         for y in range(start_row, end_row):
             for x in range(start_col, end_col):
-                tile = self.tiles[y][x]
-                if tile:
-                    tile.draw(surface, camera_x, camera_y)
-
-        # Draw buildings/units/effects on top
-        for y in range(start_row, end_row):
-            for x in range(start_col, end_col):
-                tile = self.tiles[y][x]
-                if tile:
-                    # We'll call draw methods for buildings/units from the main game loop
-                    # after the map base is drawn, using the game's lists of these objects.
-                    # However, if buildings were stored directly on tiles, we'd draw here:
-                    # tile.draw_building_or_unit(surface, camera_x, camera_y)
-                    pass
+                tile = self.get_tile(x, y)
+                if tile: tile.draw(surface, camera_x, camera_y)
